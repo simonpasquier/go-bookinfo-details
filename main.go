@@ -47,19 +47,31 @@ var (
 )
 
 var requestsTotal = prometheus.NewCounter(prometheus.CounterOpts{
-	Name: "requests_total",
+	Name: "incoming_requests_total",
 	Help: "Total number of requests to the details service",
 })
 var failedTotal = prometheus.NewCounter(prometheus.CounterOpts{
-	Name: "requests_failed_total",
+	Name: "incoming_requests_failed_total",
 	Help: "Total number of requests to the details service that have failed",
+})
+var duration = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    "outgoing_requests_duration",
+		Help:    "Histogram of request latencies to the downstream API.",
+		Buckets: []float64{.1, .5, 1, 1.5, 2, 5},
+	},
+	[]string{},
+)
+var inflightRequests = prometheus.NewGauge(prometheus.GaugeOpts{
+	Name: "incoming_requests_in_flight",
+	Help: "Number of in-flight requests to the details service.",
 })
 
 func init() {
 	flag.BoolVar(&help, "help", false, "Help message")
 	flag.StringVar(&listen, "listen-address", ":8080", "Listen address")
 
-	prometheus.MustRegister(requestsTotal, failedTotal)
+	prometheus.MustRegister(requestsTotal, failedTotal, duration, inflightRequests)
 }
 
 type errorResponse struct {
@@ -127,6 +139,8 @@ func main() {
 
 	http.HandleFunc("/details/", func(w http.ResponseWriter, r *http.Request) {
 		requestsTotal.Inc()
+		inflightRequests.Inc()
+		defer inflightRequests.Dec()
 		var err error
 		defer func() {
 			if err != nil {
@@ -136,6 +150,11 @@ func main() {
 			}
 		}()
 		isbn := strings.TrimPrefix(r.URL.Path, "/details/")
+		if isbn == "0" {
+			// The productpage application always send 0 as the ISBN so
+			// hard-code here with one of the ISBN for "The comedy of errors".
+			isbn = "0486424618"
+		}
 		i, err := strconv.Atoi(isbn)
 		if err != nil {
 			return
@@ -143,13 +162,13 @@ func main() {
 
 		svc, err := books.New(
 			&http.Client{
-				Transport: &http.Transport{
+				Transport: promhttp.InstrumentRoundTripperDuration(duration, &http.Transport{
 					IdleConnTimeout: 5 * time.Minute,
 					DialContext: conntrack.NewDialContextFunc(
 						conntrack.DialWithTracing(),
 						conntrack.DialWithName("google-api"),
 					),
-				},
+				}),
 			},
 		)
 		//svc, err := books.New(c)
