@@ -32,8 +32,9 @@ import (
 )
 
 var (
-	help         bool
-	listen, file string
+	help           bool
+	listen         string
+	timeout, delay time.Duration
 
 	incomingHeaders = []string{
 		"x-request-id",
@@ -46,30 +47,34 @@ var (
 	}
 )
 
-var requestsTotal = prometheus.NewCounter(prometheus.CounterOpts{
-	Name: "incoming_requests_total",
-	Help: "Total number of requests to the details service",
-})
-var failedTotal = prometheus.NewCounter(prometheus.CounterOpts{
-	Name: "incoming_requests_failed_total",
-	Help: "Total number of requests to the details service that have failed",
-})
-var duration = prometheus.NewHistogramVec(
-	prometheus.HistogramOpts{
-		Name:    "outgoing_requests_duration",
-		Help:    "Histogram of request latencies to the downstream API.",
-		Buckets: []float64{.1, .5, 1, 1.5, 2, 5},
-	},
-	[]string{},
+var (
+	requestsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "incoming_requests_total",
+		Help: "Total number of requests to the details service",
+	})
+	failedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "incoming_requests_failed_total",
+		Help: "Total number of requests to the details service that have failed",
+	})
+	duration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "outgoing_requests_duration",
+			Help:    "Histogram of request latencies to the downstream API.",
+			Buckets: []float64{.1, .5, 1, 1.5, 2, 5},
+		},
+		[]string{},
+	)
+	inflightRequests = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "incoming_requests_in_flight",
+		Help: "Number of in-flight requests to the details service.",
+	})
 )
-var inflightRequests = prometheus.NewGauge(prometheus.GaugeOpts{
-	Name: "incoming_requests_in_flight",
-	Help: "Number of in-flight requests to the details service.",
-})
 
 func init() {
 	flag.BoolVar(&help, "help", false, "Help message")
 	flag.StringVar(&listen, "listen-address", ":8080", "Listen address")
+	flag.DurationVar(&timeout, "timeout", 5*time.Second, "Maximum duration to wait for downstream API")
+	flag.DurationVar(&delay, "delay", 0*time.Second, "Artifical delay to wait after receiving the response from the downstream API")
 
 	prometheus.MustRegister(requestsTotal, failedTotal, duration, inflightRequests)
 }
@@ -141,6 +146,7 @@ func main() {
 		requestsTotal.Inc()
 		inflightRequests.Inc()
 		defer inflightRequests.Dec()
+
 		var err error
 		defer func() {
 			if err != nil {
@@ -163,7 +169,7 @@ func main() {
 		svc, err := books.New(
 			&http.Client{
 				Transport: promhttp.InstrumentRoundTripperDuration(duration, &http.Transport{
-					IdleConnTimeout: 5 * time.Minute,
+					IdleConnTimeout: 1 * time.Minute,
 					DialContext: conntrack.NewDialContextFunc(
 						conntrack.DialWithTracing(),
 						conntrack.DialWithName("google-api"),
@@ -171,7 +177,6 @@ func main() {
 				}),
 			},
 		)
-		//svc, err := books.New(c)
 		if err != nil {
 			return
 		}
@@ -180,16 +185,17 @@ func main() {
 		volCall := volService.List(fmt.Sprintf("isbn:%s", isbn))
 
 		ctx := r.Context()
-		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		volCall = volCall.Context(ctx)
 
 		// Add tracing headers
 		header := volCall.Header()
-		for _, h := range []string{} {
+		for _, h := range incomingHeaders {
 			header.Add(h, r.Header.Get(h))
 		}
 
+		// Do request to downstream API.
 		vols, err := volCall.Do()
 		if err != nil {
 			return
@@ -218,6 +224,9 @@ func main() {
 		if vol.PrintType == "BOOK" {
 			book.Type = "paperback"
 		}
+
+		time.Sleep(delay)
+
 		writeResponseOK(w, book)
 	})
 
