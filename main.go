@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/mwitkow/go-conntrack"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/api/books/v1"
 )
@@ -45,9 +46,20 @@ var (
 	}
 )
 
+var requestsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	Name: "requests_total",
+	Help: "Total number of requests to the details service",
+})
+var failedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	Name: "requests_failed_total",
+	Help: "Total number of requests to the details service that have failed",
+})
+
 func init() {
 	flag.BoolVar(&help, "help", false, "Help message")
 	flag.StringVar(&listen, "listen-address", ":8080", "Listen address")
+
+	prometheus.MustRegister(requestsTotal, failedTotal)
 }
 
 type errorResponse struct {
@@ -114,9 +126,12 @@ func main() {
 	http.HandleFunc("/metrics", promhttp.Handler().ServeHTTP)
 
 	http.HandleFunc("/details/", func(w http.ResponseWriter, r *http.Request) {
+		requestsTotal.Inc()
 		var err error
 		defer func() {
 			if err != nil {
+				failedTotal.Inc()
+				log.Printf("/details/ error: %q", err)
 				writeResponseBadRequest(w, err)
 			}
 		}()
@@ -129,7 +144,7 @@ func main() {
 		svc, err := books.New(
 			&http.Client{
 				Transport: &http.Transport{
-					IdleConnTimeout: 5 * time.Second,
+					IdleConnTimeout: 5 * time.Minute,
 					DialContext: conntrack.NewDialContextFunc(
 						conntrack.DialWithTracing(),
 						conntrack.DialWithName("google-api"),
