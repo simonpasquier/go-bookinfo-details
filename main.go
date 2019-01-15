@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
@@ -35,6 +36,8 @@ var (
 	help           bool
 	listen         string
 	timeout, delay time.Duration
+	errorRatio     float64
+	gen            *rand.Rand
 
 	incomingHeaders = []string{
 		"x-request-id",
@@ -75,6 +78,14 @@ func init() {
 	flag.StringVar(&listen, "listen-address", ":8080", "Listen address")
 	flag.DurationVar(&timeout, "timeout", 5*time.Second, "Maximum duration to wait for downstream API")
 	flag.DurationVar(&delay, "delay", 0*time.Second, "Artifical delay to wait after receiving the response from the downstream API")
+	flag.Float64Var(&errorRatio, "error", 0.0, "Ratio of injected error responses")
+	if errorRatio < 0.0 {
+		errorRatio = 0.0
+	}
+	if errorRatio > 1.0 {
+		errorRatio = 1.0
+	}
+	gen = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	prometheus.MustRegister(incomingDuration, outgoingDuration, inflightRequests)
 	for _, c := range []int{http.StatusOK, http.StatusBadRequest, http.StatusNotFound, http.StatusInternalServerError, http.StatusServiceUnavailable} {
@@ -145,6 +156,12 @@ func details(w http.ResponseWriter, r *http.Request) {
 			writeResponseError(w, code, err)
 		}
 	}()
+
+	if errorRatio > 0.0 && gen.Float64() < errorRatio {
+		err = fmt.Errorf("random error")
+		code = http.StatusServiceUnavailable
+		return
+	}
 	isbn := strings.TrimPrefix(r.URL.Path, "/details/")
 	if isbn == "0" {
 		// The productpage application always send 0 as the ISBN so
