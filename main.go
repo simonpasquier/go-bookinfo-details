@@ -225,7 +225,12 @@ func main() {
 			book.Type = "paperback"
 		}
 
-		time.Sleep(delay)
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+			return
+		case <-time.After(delay):
+		}
 
 		writeResponseOK(w, book)
 	})
