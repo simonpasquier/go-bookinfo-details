@@ -48,24 +48,24 @@ var (
 )
 
 var (
-	requestsTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "incoming_requests_total",
-		Help: "Total number of requests to the details service",
-	})
-	failedTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "incoming_requests_failed_total",
-		Help: "Total number of requests to the details service that have failed",
-	})
-	duration = prometheus.NewHistogramVec(
+	incomingDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "outgoing_requests_duration",
+			Name:    "details_incoming_requests_duration_seconds",
+			Help:    "Histogram of incoming request latencies.",
+			Buckets: []float64{.1, .5, 1, 1.5, 2, 5},
+		},
+		[]string{"code"},
+	)
+	outgoingDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "details_outgoing_requests_duration",
 			Help:    "Histogram of request latencies to the downstream API.",
 			Buckets: []float64{.1, .5, 1, 1.5, 2, 5},
 		},
-		[]string{},
+		[]string{"code"},
 	)
 	inflightRequests = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "incoming_requests_in_flight",
+		Name: "details_incoming_requests_in_flight",
 		Help: "Number of in-flight requests to the details service.",
 	})
 )
@@ -76,7 +76,10 @@ func init() {
 	flag.DurationVar(&timeout, "timeout", 5*time.Second, "Maximum duration to wait for downstream API")
 	flag.DurationVar(&delay, "delay", 0*time.Second, "Artifical delay to wait after receiving the response from the downstream API")
 
-	prometheus.MustRegister(requestsTotal, failedTotal, duration, inflightRequests)
+	prometheus.MustRegister(incomingDuration, outgoingDuration, inflightRequests)
+	for _, c := range []int{http.StatusOK, http.StatusBadRequest, http.StatusNotFound, http.StatusInternalServerError, http.StatusServiceUnavailable} {
+		incomingDuration.WithLabelValues(fmt.Sprintf("%d", c))
+	}
 }
 
 type errorResponse struct {
@@ -99,13 +102,13 @@ type detailsResponse struct {
 	Isbn13    string `json:"ISBN-13"`
 }
 
-func writeResponseBadRequest(w http.ResponseWriter, e error) {
+func writeResponseError(w http.ResponseWriter, code int, e error) {
 	b, err := json.Marshal(&errorResponse{Message: fmt.Sprintf("%s", e)})
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	w.WriteHeader(http.StatusBadRequest)
+	w.WriteHeader(code)
 	w.Write(b)
 }
 
@@ -128,6 +131,101 @@ func getISBN(identifiers []*books.VolumeVolumeInfoIndustryIdentifiers, typ strin
 	return ""
 }
 
+func details(w http.ResponseWriter, r *http.Request) {
+	inflightRequests.Inc()
+	defer inflightRequests.Dec()
+
+	var (
+		err  error
+		code = http.StatusOK
+	)
+	defer func() {
+		if err != nil {
+			log.Printf("/details/ error: %q", err)
+			writeResponseError(w, code, err)
+		}
+	}()
+	isbn := strings.TrimPrefix(r.URL.Path, "/details/")
+	if isbn == "0" {
+		// The productpage application always send 0 as the ISBN so
+		// hard-code here with one of the ISBN for "The comedy of errors".
+		isbn = "0486424618"
+	}
+	id, err := strconv.Atoi(isbn)
+	if err != nil {
+		code = http.StatusBadRequest
+		return
+	}
+
+	svc, err := books.New(
+		&http.Client{
+			Transport: promhttp.InstrumentRoundTripperDuration(outgoingDuration, &http.Transport{
+				IdleConnTimeout: 1 * time.Minute,
+				DialContext: conntrack.NewDialContextFunc(
+					conntrack.DialWithTracing(),
+					conntrack.DialWithName("google-api"),
+				),
+			}),
+		},
+	)
+	if err != nil {
+		code = http.StatusInternalServerError
+		return
+	}
+
+	volService := books.NewVolumesService(svc)
+	volCall := volService.List(fmt.Sprintf("isbn:%s", isbn))
+
+	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	volCall = volCall.Context(ctx)
+
+	// Add tracing headers
+	header := volCall.Header()
+	for _, h := range incomingHeaders {
+		header.Add(h, r.Header.Get(h))
+	}
+
+	// Do request to downstream API.
+	vols, err := volCall.Do()
+	if err != nil {
+		code = http.StatusInternalServerError
+		if ctx.Err() != nil {
+			code = http.StatusServiceUnavailable
+		}
+		return
+	}
+	if len(vols.Items) == 0 {
+		err = fmt.Errorf("ISBN %s not found", isbn)
+		code = http.StatusNotFound
+		return
+	}
+
+	vol := vols.Items[0].VolumeInfo
+
+	book := &detailsResponse{
+		ID:        id,
+		Author:    vol.Authors[0],
+		Year:      vol.PublishedDate,
+		Type:      vol.PrintType,
+		Pages:     vol.PageCount,
+		Publisher: vol.Publisher,
+		Language:  vol.Language,
+		Isbn10:    getISBN(vol.IndustryIdentifiers, "ISBN_10"),
+		Isbn13:    getISBN(vol.IndustryIdentifiers, "ISBN_13"),
+	}
+	if vol.Language == "en" {
+		book.Language = "English"
+	}
+	if vol.PrintType == "BOOK" {
+		book.Type = "paperback"
+	}
+
+	<-time.After(delay)
+	writeResponseOK(w, book)
+}
+
 func main() {
 	flag.Parse()
 	if help {
@@ -141,99 +239,12 @@ func main() {
 	})
 
 	http.HandleFunc("/metrics", promhttp.Handler().ServeHTTP)
-
-	http.HandleFunc("/details/", func(w http.ResponseWriter, r *http.Request) {
-		requestsTotal.Inc()
-		inflightRequests.Inc()
-		defer inflightRequests.Dec()
-
-		var err error
-		defer func() {
-			if err != nil {
-				failedTotal.Inc()
-				log.Printf("/details/ error: %q", err)
-				writeResponseBadRequest(w, err)
-			}
-		}()
-		isbn := strings.TrimPrefix(r.URL.Path, "/details/")
-		if isbn == "0" {
-			// The productpage application always send 0 as the ISBN so
-			// hard-code here with one of the ISBN for "The comedy of errors".
-			isbn = "0486424618"
-		}
-		i, err := strconv.Atoi(isbn)
-		if err != nil {
-			return
-		}
-
-		svc, err := books.New(
-			&http.Client{
-				Transport: promhttp.InstrumentRoundTripperDuration(duration, &http.Transport{
-					IdleConnTimeout: 1 * time.Minute,
-					DialContext: conntrack.NewDialContextFunc(
-						conntrack.DialWithTracing(),
-						conntrack.DialWithName("google-api"),
-					),
-				}),
-			},
-		)
-		if err != nil {
-			return
-		}
-
-		volService := books.NewVolumesService(svc)
-		volCall := volService.List(fmt.Sprintf("isbn:%s", isbn))
-
-		ctx := r.Context()
-		ctx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		volCall = volCall.Context(ctx)
-
-		// Add tracing headers
-		header := volCall.Header()
-		for _, h := range incomingHeaders {
-			header.Add(h, r.Header.Get(h))
-		}
-
-		// Do request to downstream API.
-		vols, err := volCall.Do()
-		if err != nil {
-			return
-		}
-		if len(vols.Items) == 0 {
-			err = fmt.Errorf("found 0 items for ISBN %d", i)
-			return
-		}
-
-		vol := vols.Items[0].VolumeInfo
-
-		book := &detailsResponse{
-			ID:        i,
-			Author:    vol.Authors[0],
-			Year:      vol.PublishedDate,
-			Type:      vol.PrintType,
-			Pages:     vol.PageCount,
-			Publisher: vol.Publisher,
-			Language:  vol.Language,
-			Isbn10:    getISBN(vol.IndustryIdentifiers, "ISBN_10"),
-			Isbn13:    getISBN(vol.IndustryIdentifiers, "ISBN_13"),
-		}
-		if vol.Language == "en" {
-			book.Language = "English"
-		}
-		if vol.PrintType == "BOOK" {
-			book.Type = "paperback"
-		}
-
-		select {
-		case <-ctx.Done():
-			err = ctx.Err()
-			return
-		case <-time.After(delay):
-		}
-
-		writeResponseOK(w, book)
-	})
+	http.Handle("/details/", promhttp.InstrumentHandlerInFlight(
+		inflightRequests,
+		promhttp.InstrumentHandlerDuration(incomingDuration,
+			http.HandlerFunc(details),
+		),
+	))
 
 	log.Println("Listening on", listen)
 	log.Fatal(http.ListenAndServe(listen, nil))
