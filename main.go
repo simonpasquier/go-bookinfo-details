@@ -24,6 +24,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mwitkow/go-conntrack"
@@ -33,11 +34,12 @@ import (
 )
 
 var (
-	help           bool
-	listen         string
-	timeout, delay time.Duration
-	errorRatio     float64
-	gen            *rand.Rand
+	help                   bool
+	listen                 string
+	timeout, delay, expiry time.Duration
+	errorRatio             float64
+	gen                    *rand.Rand
+	store                  responseCache
 
 	incomingHeaders = []string{
 		"x-request-id",
@@ -78,6 +80,7 @@ func init() {
 	flag.StringVar(&listen, "listen-address", ":8080", "Listen address")
 	flag.DurationVar(&timeout, "timeout", 5*time.Second, "Maximum duration to wait for downstream API")
 	flag.DurationVar(&delay, "delay", 0*time.Second, "Artifical delay to wait after receiving the response from the downstream API")
+	flag.DurationVar(&expiry, "cache-expiry", 5*time.Second, "How long to keep objects in the cache")
 	flag.Float64Var(&errorRatio, "error", 0.0, "Ratio of injected error responses")
 	if errorRatio < 0.0 {
 		errorRatio = 0.0
@@ -111,6 +114,76 @@ type detailsResponse struct {
 	Language  string `json:"language"`
 	Isbn10    string `json:"ISBN-10"`
 	Isbn13    string `json:"ISBN-13"`
+}
+
+type responseCache interface {
+	get(int) *detailsResponse
+	set(*detailsResponse)
+}
+
+type noopCache struct{}
+
+func (c *noopCache) get(int) *detailsResponse { return nil }
+func (c *noopCache) set(*detailsResponse)     {}
+
+type cache struct {
+	expiry  time.Duration
+	mtx     sync.Mutex
+	entries map[int]*cacheEntry
+}
+
+type cacheEntry struct {
+	response *detailsResponse
+	ttl      time.Time
+}
+
+func newCache(expiry time.Duration) *cache {
+	c := &cache{
+		mtx:     sync.Mutex{},
+		entries: make(map[int]*cacheEntry),
+	}
+	go func() {
+		for {
+			select {
+			case <-time.After(1 * time.Second):
+				c.mtx.Lock()
+				now := time.Now()
+				for k := range c.entries {
+					if c.entries[k].ttl.Before(now) {
+						delete(c.entries, k)
+					}
+				}
+				c.mtx.Unlock()
+			}
+		}
+	}()
+	return c
+}
+
+func (c *cache) get(id int) *detailsResponse {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	e, ok := c.entries[id]
+	if !ok {
+		return nil
+	}
+	if time.Now().After(e.ttl) {
+		return nil
+	}
+	return e.response
+}
+
+func (c *cache) set(d *detailsResponse) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	_, ok := c.entries[d.ID]
+	if !ok {
+		return
+	}
+	c.entries[d.ID] = &cacheEntry{
+		response: d,
+		ttl:      time.Now().Add(c.expiry),
+	}
 }
 
 func writeResponseError(w http.ResponseWriter, code int, e error) {
@@ -171,6 +244,10 @@ func details(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.Atoi(isbn)
 	if err != nil {
 		code = http.StatusBadRequest
+		return
+	}
+	if v := store.get(id); v != nil {
+		writeResponseOK(w, v)
 		return
 	}
 
@@ -238,6 +315,7 @@ func details(w http.ResponseWriter, r *http.Request) {
 	if vol.PrintType == "BOOK" {
 		book.Type = "paperback"
 	}
+	store.set(book)
 
 	<-time.After(delay)
 	writeResponseOK(w, book)
@@ -249,6 +327,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Bookinfo details service")
 		flag.PrintDefaults()
 		os.Exit(0)
+	}
+
+	if expiry > time.Duration(0) {
+		store = newCache(expiry)
+	} else {
+		store = &noopCache{}
 	}
 
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
