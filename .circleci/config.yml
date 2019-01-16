@@ -1,0 +1,44 @@
+version: 2
+
+jobs:
+  build:
+    docker:
+    - image: circleci/golang:1.11
+
+    steps:
+    - checkout
+    - run: go test -v ./...
+    - run: go build ./...
+    - persist_to_workspace:
+        root: .
+        paths:
+        - details
+
+  push_image:
+    docker:
+    - image: circleci/golang:1.11
+
+    steps:
+    - checkout
+    - setup_remote_docker
+    - attach_workspace:
+        at: .
+    - run: docker login -u $DOCKER_LOGIN -p $DOCKER_PASSWORD quay.io
+    - run: docker build -t quay.io/simonpasquier/details:latest .
+    - run: docker push quay.io/simonpasquier/details
+
+
+workflows:
+  version: 2
+  main:
+    jobs:
+    - build:
+        filters:
+          tags:
+            only: /.*/
+    - push_image:
+        requires:
+        - build
+        filters:
+          branches:
+            only: master
