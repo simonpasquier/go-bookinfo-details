@@ -63,7 +63,7 @@ var (
 	)
 	outgoingDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "details_outgoing_requests_duration",
+			Name:    "details_outgoing_requests_duration_seconds",
 			Help:    "Histogram of request latencies to the downstream API.",
 			Buckets: []float64{.1, .5, 1, 1.5, 2, 5},
 		},
