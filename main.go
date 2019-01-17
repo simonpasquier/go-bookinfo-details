@@ -73,6 +73,15 @@ var (
 		Name: "details_incoming_requests_in_flight",
 		Help: "Number of in-flight requests to the details service.",
 	})
+	cacheSize = prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "details_cache_size",
+			Help: "Number of items in the in-memory cache",
+		},
+		func() float64 {
+			return float64(store.length())
+		},
+	)
 )
 
 func init() {
@@ -80,7 +89,7 @@ func init() {
 	flag.StringVar(&listen, "listen-address", ":8080", "Listen address")
 	flag.DurationVar(&timeout, "timeout", 5*time.Second, "Maximum duration to wait for downstream API")
 	flag.DurationVar(&delay, "delay", 0*time.Second, "Artifical delay to wait after receiving the response from the downstream API")
-	flag.DurationVar(&expiry, "cache-expiry", 5*time.Second, "How long to keep objects in the cache")
+	flag.DurationVar(&expiry, "cache-expiry", 0*time.Second, "How long to keep objects in the cache")
 	flag.Float64Var(&errorRatio, "error", 0.0, "Ratio of injected error responses")
 	if errorRatio < 0.0 {
 		errorRatio = 0.0
@@ -119,12 +128,14 @@ type detailsResponse struct {
 type responseCache interface {
 	get(int) *detailsResponse
 	set(*detailsResponse)
+	length() int
 }
 
 type noopCache struct{}
 
 func (c *noopCache) get(int) *detailsResponse { return nil }
 func (c *noopCache) set(*detailsResponse)     {}
+func (c *noopCache) length() int              { return 0 }
 
 type cache struct {
 	expiry  time.Duration
@@ -141,6 +152,7 @@ func newCache(expiry time.Duration) *cache {
 	c := &cache{
 		mtx:     sync.Mutex{},
 		entries: make(map[int]*cacheEntry),
+		expiry:  expiry,
 	}
 	go func() {
 		for {
@@ -176,14 +188,16 @@ func (c *cache) get(id int) *detailsResponse {
 func (c *cache) set(d *detailsResponse) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
-	_, ok := c.entries[d.ID]
-	if !ok {
-		return
-	}
 	c.entries[d.ID] = &cacheEntry{
 		response: d,
 		ttl:      time.Now().Add(c.expiry),
 	}
+}
+
+func (c *cache) length() int {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return len(c.entries)
 }
 
 func writeResponseError(w http.ResponseWriter, code int, e error) {
@@ -230,11 +244,13 @@ func details(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Inject some errors if required.
 	if errorRatio > 0.0 && gen.Float64() < errorRatio {
 		err = fmt.Errorf("random error")
 		code = http.StatusServiceUnavailable
 		return
 	}
+
 	isbn := strings.TrimPrefix(r.URL.Path, "/details/")
 	if isbn == "0" {
 		// The productpage application always send 0 as the ISBN so
@@ -263,6 +279,7 @@ func details(w http.ResponseWriter, r *http.Request) {
 		},
 	)
 	if err != nil {
+		//TODO: implement fallback response
 		code = http.StatusInternalServerError
 		return
 	}
@@ -275,13 +292,13 @@ func details(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	volCall = volCall.Context(ctx)
 
-	// Add tracing headers
+	// Add tracing headers.
 	header := volCall.Header()
 	for _, h := range incomingHeaders {
 		header.Add(h, r.Header.Get(h))
 	}
 
-	// Do request to downstream API.
+	// Send the request to the downstream API.
 	vols, err := volCall.Do()
 	if err != nil {
 		code = http.StatusInternalServerError
@@ -330,6 +347,7 @@ func main() {
 	}
 
 	if expiry > time.Duration(0) {
+		log.Printf("Using cache expiry (ttl=%v)", expiry)
 		store = newCache(expiry)
 	} else {
 		store = &noopCache{}
