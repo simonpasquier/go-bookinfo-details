@@ -270,7 +270,7 @@ func details(w http.ResponseWriter, r *http.Request) {
 	svc, err := books.New(
 		&http.Client{
 			Transport: promhttp.InstrumentRoundTripperDuration(outgoingDuration, &http.Transport{
-				IdleConnTimeout: 1 * time.Minute,
+				IdleConnTimeout: 10 * timeout,
 				DialContext: conntrack.NewDialContextFunc(
 					conntrack.DialWithTracing(),
 					conntrack.DialWithName("google-api"),
