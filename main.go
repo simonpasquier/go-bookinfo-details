@@ -79,6 +79,9 @@ var (
 			Help: "Number of items in the in-memory cache",
 		},
 		func() float64 {
+			if store == nil {
+				return 0
+			}
 			return float64(store.length())
 		},
 	)
@@ -99,7 +102,7 @@ func init() {
 	}
 	gen = rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	prometheus.MustRegister(incomingDuration, outgoingDuration, inflightRequests)
+	prometheus.MustRegister(incomingDuration, outgoingDuration, inflightRequests, cacheSize)
 	for _, c := range []int{http.StatusOK, http.StatusBadRequest, http.StatusNotFound, http.StatusInternalServerError, http.StatusServiceUnavailable} {
 		incomingDuration.WithLabelValues(fmt.Sprintf("%d", c))
 	}
@@ -155,18 +158,15 @@ func newCache(expiry time.Duration) *cache {
 		expiry:  expiry,
 	}
 	go func() {
-		for {
-			select {
-			case <-time.After(1 * time.Second):
-				c.mtx.Lock()
-				now := time.Now()
-				for k := range c.entries {
-					if c.entries[k].ttl.Before(now) {
-						delete(c.entries, k)
-					}
+		for range time.After(1 * time.Second) {
+			c.mtx.Lock()
+			now := time.Now()
+			for k := range c.entries {
+				if c.entries[k].ttl.Before(now) {
+					delete(c.entries, k)
 				}
-				c.mtx.Unlock()
 			}
+			c.mtx.Unlock()
 		}
 	}()
 	return c
@@ -207,7 +207,7 @@ func writeResponseError(w http.ResponseWriter, code int, e error) {
 		return
 	}
 	w.WriteHeader(code)
-	w.Write(b)
+	_, _ = w.Write(b)
 }
 
 func writeResponseOK(w http.ResponseWriter, v interface{}) {
@@ -217,7 +217,7 @@ func writeResponseOK(w http.ResponseWriter, v interface{}) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	w.Write(b)
+	_, _ = w.Write(b)
 }
 
 func getISBN(identifiers []*books.VolumeVolumeInfoIndustryIdentifiers, typ string) string {
