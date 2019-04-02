@@ -31,6 +31,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/api/books/v1"
+	"google.golang.org/api/option"
 )
 
 var (
@@ -267,16 +268,22 @@ func details(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	svc, err := books.New(
-		&http.Client{
-			Transport: promhttp.InstrumentRoundTripperDuration(outgoingDuration, &http.Transport{
-				IdleConnTimeout: 10 * timeout,
-				DialContext: conntrack.NewDialContextFunc(
-					conntrack.DialWithTracing(),
-					conntrack.DialWithName("google-api"),
-				),
-			}),
-		},
+	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	svc, err := books.NewService(
+		ctx,
+		option.WithHTTPClient(
+			&http.Client{
+				Transport: promhttp.InstrumentRoundTripperDuration(outgoingDuration, &http.Transport{
+					IdleConnTimeout: 10 * timeout,
+					DialContext: conntrack.NewDialContextFunc(
+						conntrack.DialWithTracing(),
+						conntrack.DialWithName("google-api"),
+					),
+				}),
+			},
+		),
 	)
 	if err != nil {
 		//TODO: implement fallback response
@@ -287,9 +294,6 @@ func details(w http.ResponseWriter, r *http.Request) {
 	volService := books.NewVolumesService(svc)
 	volCall := volService.List(fmt.Sprintf("isbn:%s", isbn))
 
-	ctx := r.Context()
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	volCall = volCall.Context(ctx)
 
 	// Add tracing headers.
