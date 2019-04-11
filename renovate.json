@@ -1,5 +1,13 @@
 {
   "extends": [
     "config:base"
-  ]
+  ],
+  "postUpdateOptions": [
+    "gomodTidy"
+  ],
+  "ignoreDeps": [],
+  "labels": [
+    "dependencies"
+  ],
+  "prConcurrentLimit": 4
 }
